@@ -212,9 +212,9 @@ function getData_(officeName) {
     parseRow_(r.values[0], r.values[1], r.values[2]).forEach(it => items.push(Object.assign(it, { row: r.row })));
   });
 
+  // Log, people and events cover every office: carts can span offices,
+  // and autofill should work on any tab.
   const log = logRows_();
-  const officeLog = log.filter(l => l.office === office.name);
-  // People and events from every office, so autofill works across tabs.
   const people = {};
   log.forEach(l => { if (l.netid) people[String(l.netid).toLowerCase()] = l.name; });
   const events = Array.from(new Set(log.map(l => l.event).filter(String)));
@@ -223,32 +223,48 @@ function getData_(officeName) {
     config: { title: cfg.title, requireEvent: !!cfg.requireEvent, offices: cfg.offices.map(o => o.name) },
     office: office.name,
     items,
-    out: officeLog.filter(l => l.status === 'OUT').reverse(),
-    recent: officeLog.slice(-25).reverse(),
+    out: log.filter(l => l.status === 'OUT').reverse(),
+    recent: log.slice(-25).reverse(),
     people,
     events,
   };
 }
 
+// Takes a cart (`items`: [{office, item, box, qty}]) or a single item; one log row per item.
 function checkout_(b) {
-  const required = ['office', 'item', 'name', 'netid'].concat(getConfig_().requireEvent ? ['event'] : []);
+  const required = ['name', 'netid'].concat(getConfig_().requireEvent ? ['event'] : []);
   required.forEach(k => {
     if (!String(b[k] || '').trim()) throw new Error('Missing ' + k);
   });
-  findOffice_(b.office);
-  const id = Utilities.getUuid().slice(0, 8);
-  logSheet_().appendRow([
-    id, new Date(), b.office, b.item, b.box || '', Number(b.qty) || 1,
+  const items = b.items || [{ office: b.office, item: b.item, box: b.box, qty: b.qty }];
+  if (!items.length) throw new Error('Nothing to check out');
+  items.forEach(it => {
+    if (!String(it.item || '').trim()) throw new Error('Missing item');
+    findOffice_(it.office);
+  });
+  const now = new Date();
+  const rows = items.map(it => [
+    Utilities.getUuid().slice(0, 8), now, it.office, it.item, it.box || '', Number(it.qty) || 1,
     b.name.trim(), b.netid.trim().toLowerCase(), (b.event || '').trim(), 'OUT', '',
   ]);
-  return { id };
+  const sh = logSheet_();
+  sh.getRange(sh.getLastRow() + 1, 1, rows.length, LOG_HEADERS.length).setValues(rows);
+  return { ids: rows.map(r => r[0]) };
 }
 
+// Takes `ids` (several) or `id` (one).
 function checkin_(b) {
-  const entry = findLog_(b.id);
-  if (entry.status !== 'OUT') throw new Error('Already checked in');
-  logSheet_().getRange(entry.row, 10, 1, 2).setValues([['IN', new Date()]]);
-  return { id: entry.id };
+  const log = logRows_();
+  const entries = (b.ids || [b.id]).map(id => {
+    const entry = log.find(l => l.id === String(id));
+    if (!entry) throw new Error('Checkout not found');
+    return entry;
+  }).filter(e => e.status === 'OUT');
+  if (!entries.length) throw new Error('Already checked in');
+  const sh = logSheet_();
+  const now = new Date();
+  entries.forEach(e => sh.getRange(e.row, 10, 1, 2).setValues([['IN', now]]));
+  return { ids: entries.map(e => e.id) };
 }
 
 function updateLog_(p) {
