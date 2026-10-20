@@ -90,9 +90,18 @@ function saveConfig_(c) {
     if (!sheetNames.includes(o.sheet)) throw new Error('Sheet tab not found: ' + o.sheet);
   });
   if (new Set(offices.map(o => o.name)).size !== offices.length) throw new Error('Office names must be different.');
-  const cfg = { title: String(c.title || '').trim() || DEFAULT_CONFIG.title, requireEvent: !!c.requireEvent, offices };
-  PropertiesService.getScriptProperties().setProperty('config', JSON.stringify(cfg));
+  const cfg = {
+    title: String(c.title || '').trim() || DEFAULT_CONFIG.title,
+    requireEvent: !!c.requireEvent,
+    offices,
+    admins: getConfig_().admins || [],
+  };
+  writeConfig_(cfg);
   return cfg;
+}
+
+function writeConfig_(cfg) {
+  PropertiesService.getScriptProperties().setProperty('config', JSON.stringify(cfg));
 }
 
 // ---------- Inventory ----------
@@ -279,19 +288,57 @@ function updateLog_(p) {
 
 // ---------- Admin portal ----------
 
-// Admins are the people the spreadsheet is shared with as editors.
+function sheetEditors_() {
+  const ss = ss_();
+  return ss.getEditors().concat(ss.getOwner() || []).map(u => u.getEmail().toLowerCase());
+}
+
+// Admins are the emails in the admin list (Settings). Until that list is
+// set, every editor of the spreadsheet is an admin.
 function requireAdmin_() {
   const email = Session.getActiveUser().getEmail().toLowerCase();
   if (!email) throw new Error('Sign in to Google to use the admin portal.');
-  let admins;
+  const admins = getConfig_().admins || [];
+  if (admins.length) {
+    if (!admins.includes(email)) throw new Error(email + ' is not an admin. Ask an admin to add you in Settings.');
+    return email;
+  }
+  let editors;
   try {
-    const ss = ss_();
-    admins = ss.getEditors().concat(ss.getOwner() || []).map(u => u.getEmail().toLowerCase());
+    editors = sheetEditors_();
   } catch (err) {
     throw new Error(email + ' does not have edit access to the inventory sheet.');
   }
-  if (!admins.includes(email)) throw new Error(email + ' does not have edit access to the inventory sheet.');
+  if (!editors.includes(email)) throw new Error(email + ' does not have edit access to the inventory sheet.');
   return email;
+}
+
+// Adds an admin and, if needed, shares the spreadsheet with them as an
+// editor (the portal runs as the signed-in user, so admins need edit access).
+function addAdmin_(p, me) {
+  const email = String(p.email || '').trim().toLowerCase();
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw new Error('Enter a full email address.');
+  const cfg = getConfig_();
+  // The first admin added also locks in whoever is adding, so they aren't shut out.
+  const admins = new Set((cfg.admins || []).length ? cfg.admins : [me]);
+  admins.add(email);
+  let shared = false;
+  if (!sheetEditors_().includes(email)) {
+    ss_().addEditor(email);
+    shared = true;
+  }
+  cfg.admins = [...admins];
+  writeConfig_(cfg);
+  return { admins: cfg.admins, shared };
+}
+
+function removeAdmin_(p, me) {
+  const email = String(p.email || '').trim().toLowerCase();
+  if (email === me) throw new Error("You can't remove yourself. Ask another admin.");
+  const cfg = getConfig_();
+  cfg.admins = (cfg.admins || []).filter(a => a !== email);
+  writeConfig_(cfg);
+  return { admins: cfg.admins };
 }
 
 // Single entry point for Admin.html (google.script.run).
@@ -317,6 +364,8 @@ function adminApi(action, p) {
       case 'addRow': return addRow_(p);
       case 'deleteRow': return deleteRow_(p);
       case 'saveConfig': return saveConfig_(p.config);
+      case 'addAdmin': return addAdmin_(p, email);
+      case 'removeAdmin': return removeAdmin_(p, email);
       default: throw new Error('Unknown action: ' + action);
     }
   });

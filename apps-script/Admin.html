@@ -109,7 +109,13 @@
       </div>
 
       <h2>Admins</h2>
-      <div class="note">Anyone with <b>edit access to the inventory sheet</b> can use this portal. To add or remove admins, use <b>Share</b> on the sheet: <a id="sheet-link" target="_blank">open the sheet</a>.</div>
+      <p class="muted" id="admins-note"></p>
+      <div class="wrap"><table><tbody id="admins"></tbody></table></div>
+      <form id="add-admin" class="bar" style="margin-top:10px">
+        <input id="admin-email" type="email" placeholder="netid@scarletmail.rutgers.edu" autocomplete="off">
+        <button class="primary" type="submit">Add admin</button>
+      </form>
+      <div class="note">Adding someone also gives them edit access to the <a id="sheet-link" target="_blank">inventory sheet</a> if they don't have it, since the portal needs it. Removing an admin doesn't take away their sheet access; do that with <b>Share</b> on the sheet.</div>
     </section>
   </div>
 </main>
@@ -121,7 +127,7 @@ const when = iso => { const d = new Date(iso); return isNaN(d) ? '' : d.toLocale
 const run = (action, payload) => new Promise((resolve, reject) =>
   google.script.run.withSuccessHandler(resolve).withFailureHandler(reject).adminApi(action, payload || {}));
 
-const state = { config: null, sheets: [], log: [], rows: [], editing: null, draft: null };
+const state = { config: null, sheets: [], log: [], rows: [], editing: null, draft: null, email: '' };
 
 function status(msg, cls) {
   $('status').className = 'status ' + (cls || '');
@@ -319,8 +325,45 @@ $('save-settings').onclick = async () => {
   applyConfig(saved);
 };
 
+// ---------- Admins ----------
+
+function renderAdmins() {
+  const admins = state.config.admins || [];
+  $('admins-note').textContent = admins.length
+    ? 'Only these people can open this portal.'
+    : 'No admin list yet, so everyone with edit access to the sheet can open this portal. Add an admin to switch to a fixed list (you are added automatically).';
+  $('admins').innerHTML = admins.map(a => `<tr data-email="${esc(a)}"><td>${esc(a)}${a === state.email ? ' <span class="muted">(you)</span>' : ''}</td>` +
+    `<td class="actions">${a === state.email ? '' : '<button class="small danger" data-act="remove">Remove</button>'}</td></tr>`).join('');
+}
+
+$('add-admin').onsubmit = async e => {
+  e.preventDefault();
+  const email = $('admin-email').value.trim();
+  if (!email) return;
+  let res;
+  const ok = await act('Adding ' + email, async () => { res = await run('addAdmin', { email }); });
+  if (!ok) return;
+  state.config.admins = res.admins;
+  $('admin-email').value = '';
+  renderAdmins();
+  if (res.shared) status(`Added ${email} and gave them edit access to the sheet.`, 'ok');
+};
+
+$('admins').onclick = async e => {
+  const btn = e.target.closest('button[data-act=remove]');
+  if (!btn || !armed(btn)) return;
+  const email = btn.closest('tr').dataset.email;
+  btn.disabled = true;
+  let res;
+  const ok = await act('Removing ' + email, async () => { res = await run('removeAdmin', { email }); });
+  if (!ok) { btn.disabled = false; return; }
+  state.config.admins = res.admins;
+  renderAdmins();
+};
+
 function applyConfig(cfg) {
   state.config = cfg;
+  renderAdmins();
   state.draft = JSON.parse(JSON.stringify(cfg));
   const inv = $('inv-office').value;
   $('log-office').innerHTML = officeOptions($('log-office').value, true);
@@ -334,6 +377,7 @@ function applyConfig(cfg) {
   try {
     const d = await run('init');
     state.sheets = d.sheets;
+    state.email = d.email;
     $('who').innerHTML = `Signed in as ${esc(d.email)} · <a href="${esc(d.sheetUrl)}" target="_blank">Open sheet</a>`;
     $('sheet-link').href = d.sheetUrl;
     applyConfig(d.config);

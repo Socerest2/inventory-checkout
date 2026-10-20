@@ -13,7 +13,7 @@ The **Admin** link at the bottom of the site opens the admin portal. You can cha
 - **Inventory:** edit, add or delete item rows in each office's sheet tab.
 - **Settings:** set the site title, choose whether an event is required, and manage offices (add, rename, reorder, or point them at a different sheet tab and starting row).
 
-Admins are the people who have **edit access to the inventory sheet**. You add or remove them with the sheet's **Share** button.
+**Who can open the portal:** the people on the admin list in **Settings → Admins**. Admins add and remove each other there. If someone you add doesn't have edit access to the sheet yet, adding them gives it to them, because the portal needs it. If the list is ever empty, every editor of the sheet can get in.
 
 ## Apps Script setup
 
