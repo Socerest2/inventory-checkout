@@ -1,16 +1,18 @@
 # Inventory Check Out
 
-A check-out/check-in page for the **26-27 Warehouse Inventory** Google Sheet. The page is hosted on GitHub Pages, and a Google Apps Script handles the sheet.
+A check-out/check-in page for the **Feehan-DM Inventory** Google Sheet. The page is hosted on GitHub Pages, and a Google Apps Script handles the sheet.
 
-- Every check-out adds a row to a **Checkout Log** tab in the sheet. A check-in marks that row `IN`.
-- Items are read live from each office's sheet tab (columns A–C).
+- Check-outs and check-ins are written to **Form Responses 1** in the Google Form's own format (`Take out` / `Check in`), so each tab's **Total Out** and **Current Qty** formulas count them along with real form submissions.
+- Items and their Current Qty are read live from the Warehouse, OFSA and DM Office tabs. The item columns each tab uses in Form Responses 1 are read from its Total Out formula.
+- "Checked out now" lists reusable items people still have (take-outs minus check-ins). Consumables are counted but never listed as checked out.
+- For speed, one request loads every tab, the server keeps that result for 20 seconds (any write clears it), and the page shows its last copy instantly while it refreshes.
 
 ## Admin portal
 
 The **Admin** link at the bottom of the site opens the admin portal. You can change everything there without editing any code:
 
-- **Checkouts:** search the full log, check items in, and edit or delete entries.
-- **Inventory:** edit, add or delete item rows in each office's sheet tab.
+- **Checkouts:** see who has what, check items in for someone, and search or delete rows in Form Responses 1.
+- **Inventory:** edit, add or delete item rows (the Total Out / Current Qty formulas are left alone, and new rows get them).
 - **Settings:** set the site title, choose whether an event is required, and manage offices (add, rename, reorder, or point them at a different sheet tab and starting row).
 
 **Who can open the portal:** the people on the admin list in **Settings → Admins**. Admins add and remove each other there. If someone you add doesn't have edit access to the sheet yet, adding them gives it to them, because the portal needs it. If the list is ever empty, every editor of the sheet can get in.

@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#ffffff">
 <title>Inventory Check Out</title>
+<link rel="preconnect" href="https://script.google.com">
+<link rel="preconnect" href="https://script.googleusercontent.com">
 <style>
   :root { --text: #1f2328; --muted: #6b7280; --line: #d9dde3; --accent: #0b3d91; --bg: #fff; --row: #f6f8fa; --err: #b42318; --ok: #067647; }
   * { box-sizing: border-box; }
@@ -36,11 +38,14 @@
   .grow { flex: 1; min-width: 0; }
   .name { font-weight: 500; overflow-wrap: anywhere; }
   .meta { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+  .low { color: var(--err); }
 
   button { cursor: pointer; }
   button.add { flex: none; border: 1px solid var(--accent); color: var(--accent); background: #fff; border-radius: 999px; padding: 0 16px; height: 40px; font-size: 15px; font-weight: 600; }
+  button.add:disabled { border-color: var(--line); color: var(--muted); cursor: default; }
   .stepper { flex: none; display: flex; align-items: center; border: 1px solid var(--accent); border-radius: 999px; overflow: hidden; background: #fff; }
   .stepper button { width: 40px; height: 40px; border: 0; background: none; color: var(--accent); font-size: 22px; line-height: 1; }
+  .stepper button:disabled { color: var(--line); cursor: default; }
   .stepper span { min-width: 28px; text-align: center; font-weight: 600; }
   .stepper input { width: 56px; height: 40px; border: 0; border-radius: 0; padding: 0; text-align: center; font-weight: 600; -moz-appearance: textfield; }
   .stepper input::-webkit-inner-spin-button, .stepper input::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
@@ -66,7 +71,8 @@
     main { padding-top: 24px; }
     .tabs button { font-size: 20px; padding: 12px; }
     .items { max-height: 420px; }
-    .person { grid-template-columns: 1fr 1fr 1fr auto; }
+    .person { grid-template-columns: 1fr 1fr; }
+    .person button { grid-column: 1 / -1; }
   }
 </style>
 </head>
@@ -85,15 +91,17 @@
 
   <section id="cart-section">
     <h2>Check out <span id="cart-count"></span></h2>
-    <div id="cart-empty" class="empty">Tap <b>+ Add</b> on items above. You can add as many as you need, from any office tab.</div>
+    <div id="cart-empty" class="empty">Tap <b>+ Add</b> on items above. You can add as many as you need, from any tab.</div>
     <div id="cart" class="list"></div>
     <form id="checkout" class="person" autocomplete="off">
       <input id="co-name" placeholder="Name" autocomplete="name" enterkeyhint="next" required>
       <input id="co-netid" placeholder="NetID" list="netids" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="next" required>
+      <input id="co-team" placeholder="Team" list="teams" enterkeyhint="next">
       <input id="co-event" placeholder="Event" list="events" enterkeyhint="done">
       <button class="primary" type="submit" id="co-btn" disabled>Check out</button>
     </form>
     <datalist id="netids"></datalist>
+    <datalist id="teams"></datalist>
     <datalist id="events"></datalist>
     <div id="co-status" class="status"></div>
   </section>
@@ -120,11 +128,12 @@ const store = {
   get(k) { try { return localStorage.getItem(k) || ''; } catch { return ''; } },
   set(k, v) { try { localStorage.setItem(k, v); } catch {} },
 };
-// Office list and settings come from the backend (managed in the admin portal).
-let offices = [];
+// Everything (all offices) comes from one request; the last copy is kept so
+// the page can draw instantly on the next visit while it refreshes.
+let data = null;
+try { data = JSON.parse(store.get('data') || 'null'); } catch {}
 let office = store.get('office');
-let data = { items: [], out: [], recent: [], people: {}, events: [], config: {} };
-// Cart lines: {office, item, box, qty}. Kept across reloads and office tabs.
+// Cart lines: {office, item, qty}. Kept across reloads and tabs.
 let cart = [];
 try { cart = JSON.parse(store.get('cart') || '[]'); } catch {}
 let cartInView = false;
@@ -132,11 +141,14 @@ let cartInView = false;
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const when = iso => { const d = new Date(iso); return isNaN(d) ? '' : d.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }); };
 const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
+const isConsumable = it => /consum/i.test(it.type || '');
+// Current Qty as a number, or null when the sheet has something like "?".
+const left = it => { const s = String(it?.qty ?? '').replace(/,/g, '').trim(); const n = Number(s); return s && isFinite(n) ? n : null; };
 
 async function api(method, payload) {
   if (!window.API_URL) throw new Error('API_URL is not set in config.js');
   const res = method === 'GET'
-    ? await fetch(`${API_URL}?office=${encodeURIComponent(payload.office)}`)
+    ? await fetch(API_URL)
     // text/plain avoids a CORS preflight, which Apps Script can't answer.
     : await fetch(API_URL, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: JSON.stringify(payload) });
   const json = await res.json();
@@ -144,17 +156,44 @@ async function api(method, payload) {
   return json.data;
 }
 
+function apply(d) {
+  data = d;
+  store.set('data', JSON.stringify(d));
+  if (!d.config.offices.includes(office)) office = d.config.offices[0];
+  document.title = d.config.title;
+  $('co-event').required = d.config.requireEvent;
+  $('co-event').placeholder = d.config.requireEvent ? 'Event (required)' : 'Event';
+  // Drop cart lines for items that no longer exist.
+  cart = cart.filter(c => findItem(c.office, c.item));
+  render();
+}
+
+const findItem = (off, name) => (data?.items[off] || []).find(it => it.name === name);
+
 function renderTabs() {
-  $('tabs').innerHTML = offices.map(o => `<button class="${o === office ? 'active' : ''}">${esc(o)}</button>`).join('');
-  [...$('tabs').children].forEach((b, i) => b.onclick = () => { office = offices[i]; store.set('office', office); $('filter').value = ''; load(); });
+  $('tabs').innerHTML = data.config.offices.map(o => `<button class="${o === office ? 'active' : ''}">${esc(o)}</button>`).join('');
+  [...$('tabs').children].forEach((b, i) => b.onclick = () => {
+    office = data.config.offices[i];
+    store.set('office', office);
+    $('filter').value = '';
+    renderTabs();
+    renderItems();
+    $('items').scrollTop = 0;
+  });
 }
 
 // ---------- Cart ----------
 
-const cartLine = (off, item, box) => cart.find(c => c.office === off && c.item === item && c.box === box);
+const cartLine = (off, item) => cart.find(c => c.office === off && c.item === item);
+const maxFor = c => left(findItem(c.office, c.item));
 
-function changeQty(line, delta) {
-  line.qty = Math.max(0, (Number(line.qty) || 0) + delta);
+function setQty(line, qty) {
+  const max = maxFor(line);
+  line.qty = Math.max(0, Math.floor(qty) || 0);
+  if (max !== null && line.qty > max) {
+    line.qty = max;
+    flash(`Only ${max} ${line.item} left.`, 'err');
+  }
   if (!line.qty) cart = cart.filter(c => c !== line);
   saveCart();
 }
@@ -165,19 +204,24 @@ function saveCart() {
   renderItems();
 }
 
-function stepper(qty, editable) {
+function stepper(line, editable) {
+  const max = maxFor(line);
   const mid = editable
-    ? `<input type="number" inputmode="numeric" min="1" value="${esc(qty)}" aria-label="Quantity">`
-    : `<span>${esc(qty)}</span>`;
-  return `<div class="stepper"><button type="button" data-d="-1" aria-label="One fewer">−</button>${mid}<button type="button" data-d="1" aria-label="One more">+</button></div>`;
+    ? `<input type="number" inputmode="numeric" min="1"${max !== null ? ` max="${max}"` : ''} value="${esc(line.qty)}" aria-label="Quantity">`
+    : `<span>${esc(line.qty)}</span>`;
+  return `<div class="stepper"><button type="button" data-d="-1" aria-label="One fewer">−</button>${mid}` +
+    `<button type="button" data-d="1" aria-label="One more"${max !== null && line.qty >= max ? ' disabled' : ''}>+</button></div>`;
 }
 
 function renderCart() {
   $('cart-count').textContent = cart.length ? `(${cart.length})` : '';
   $('cart-empty').hidden = cart.length > 0;
-  $('cart').innerHTML = cart.map((c, i) =>
-    `<div class="row" data-c="${i}"><div class="grow"><div class="name">${esc(c.item)}</div><div class="meta">${esc([c.office, c.box].filter(Boolean).join(' · '))}</div></div>` +
-    stepper(c.qty, true) + `<button type="button" class="icon" data-remove aria-label="Remove ${esc(c.item)}">×</button></div>`).join('');
+  $('cart').innerHTML = cart.map((c, i) => {
+    const it = findItem(c.office, c.item) || {};
+    return `<div class="row" data-c="${i}"><div class="grow"><div class="name">${esc(c.item)}</div>` +
+      `<div class="meta">${esc([c.office, isConsumable(it) ? 'consumable' : ''].filter(Boolean).join(' · '))}</div></div>` +
+      stepper(c, true) + `<button type="button" class="icon" data-remove aria-label="Remove ${esc(c.item)}">×</button></div>`;
+  }).join('');
   $('co-btn').textContent = cart.length ? `Check out ${plural(cart.length, 'item')}` : 'Check out';
   $('co-btn').disabled = !cart.length;
   $('cartbar-text').textContent = `${plural(cart.length, 'item')} in cart`;
@@ -188,40 +232,46 @@ function updateBar() { $('cartbar').hidden = !cart.length || cartInView; }
 
 $('cart').onclick = e => {
   const row = e.target.closest('[data-c]');
-  if (!row) return;
-  const line = cart[row.dataset.c];
   const btn = e.target.closest('button');
-  if (!btn) return;
+  if (!row || !btn) return;
+  const line = cart[row.dataset.c];
   if (btn.hasAttribute('data-remove')) { cart = cart.filter(c => c !== line); saveCart(); }
-  else changeQty(line, Number(btn.dataset.d));
+  else setQty(line, line.qty + Number(btn.dataset.d));
 };
 $('cart').onchange = e => {
   if (e.target.tagName !== 'INPUT') return;
-  const line = cart[e.target.closest('[data-c]').dataset.c];
-  line.qty = Math.max(1, Math.floor(Number(e.target.value)) || 1);
-  saveCart();
+  setQty(cart[e.target.closest('[data-c]').dataset.c], Math.max(1, Number(e.target.value)));
 };
 
 // ---------- Items ----------
 
 function renderItems() {
+  const items = data.items[office] || [];
   const q = $('filter').value.trim().toLowerCase();
-  const list = data.items.map((it, i) => ({ ...it, i })).filter(it => !q || `${it.name} ${it.box}`.toLowerCase().includes(q));
-  if (data.items.length) $('items-status').textContent = q ? `${list.length} of ${plural(data.items.length, 'item')}` : plural(data.items.length, 'item');
+  const list = items.map((it, i) => ({ ...it, i }))
+    .filter(it => !q || [it.name, it.category, it.location, it.type].join(' ').toLowerCase().includes(q));
+  $('items-status').className = 'status';
+  $('items-status').textContent = q ? `${list.length} of ${plural(items.length, 'item')}` : plural(items.length, 'item');
   $('items').innerHTML = list.map(it => {
-    const line = cartLine(office, it.name, it.box);
-    return `<div class="row" data-i="${it.i}"><div class="grow"><div class="name">${esc(it.name)}</div><div class="meta">${esc([it.qty, it.box].filter(Boolean).join(' · '))}</div></div>` +
-      (line ? stepper(line.qty) : `<button type="button" class="add" data-d="1" aria-label="Add ${esc(it.name)}">+ Add</button>`) + '</div>';
+    const n = left(it);
+    const line = cartLine(office, it.name);
+    const stock = n === null ? (it.qty || '') : `${n} left`;
+    const meta = [stock, it.location || it.category, isConsumable(it) ? 'consumable' : ''].filter(Boolean).join(' · ');
+    const action = line ? stepper(line)
+      : n !== null && n <= 0 ? '<button type="button" class="add" disabled>None left</button>'
+      : `<button type="button" class="add" data-d="1" aria-label="Add ${esc(it.name)}">+ Add</button>`;
+    return `<div class="row" data-i="${it.i}"><div class="grow"><div class="name">${esc(it.name)}</div>` +
+      `<div class="meta${n !== null && n <= 0 ? ' low' : ''}">${esc(meta)}</div></div>${action}</div>`;
   }).join('');
 }
 
 $('items').onclick = e => {
   const btn = e.target.closest('button[data-d]');
   if (!btn) return;
-  const it = data.items[btn.closest('[data-i]').dataset.i];
-  const line = cartLine(office, it.name, it.box);
-  if (line) return changeQty(line, Number(btn.dataset.d));
-  cart.push({ office, item: it.name, box: it.box, qty: 1 });
+  const it = data.items[office][btn.closest('[data-i]').dataset.i];
+  const line = cartLine(office, it.name);
+  if (line) return setQty(line, line.qty + Number(btn.dataset.d));
+  cart.push({ office, item: it.name, qty: 1 });
   saveCart();
 };
 $('filter').oninput = renderItems;
@@ -229,86 +279,80 @@ $('filter').oninput = renderItems;
 // ---------- Checked out / recent ----------
 
 function renderOut() {
-  if (!data.out.length) { $('out').innerHTML = '<p class="empty">Nothing checked out.</p>'; return; }
-  // One card per person, newest first.
+  const reusable = data.out;
+  if (!reusable.length) { $('out').innerHTML = '<p class="empty">Nothing checked out.</p>'; return; }
+  // One card per person.
   const groups = new Map();
-  data.out.forEach(l => {
-    const k = `${l.netid}|${l.name}`;
-    if (!groups.has(k)) groups.set(k, []);
-    groups.get(k).push(l);
+  reusable.forEach(o => {
+    if (!groups.has(o.key)) groups.set(o.key, []);
+    groups.get(o.key).push(o);
   });
-  $('out').innerHTML = [...groups.values()].map(g => {
+  $('out').innerHTML = [...groups.entries()].map(([key, g]) => {
     const first = g[0];
-    const events = [...new Set(g.map(l => l.event).filter(Boolean))].join(', ');
-    return `<div class="card"><div class="card-head"><div class="grow"><div class="name">${esc(first.name)} <span class="meta">${esc(first.netid)}</span></div>` +
-      `<div class="meta">${esc([events, 'out since ' + when(g[g.length - 1].out)].filter(Boolean).join(' · '))}</div></div>` +
-      (g.length > 1 ? `<button type="button" class="secondary" data-ids="${esc(g.map(l => l.id).join(','))}">Check in all ${g.length}</button>` : '') + '</div>' +
-      g.map(l => `<div class="row"><div class="grow"><span class="name">${esc(l.item)}</span> <span class="meta">×${esc(l.qty)}</span><div class="meta">${esc([l.office, l.box].filter(Boolean).join(' · '))}</div></div>` +
-        `<button type="button" class="secondary" data-ids="${esc(l.id)}">Check in</button></div>`).join('') + '</div>';
+    const events = [...new Set(g.map(o => o.event).filter(Boolean))].join(', ');
+    const oldest = g.reduce((a, o) => (o.since < a ? o.since : a), first.since);
+    return `<div class="card"><div class="card-head"><div class="grow"><div class="name">${esc(first.name)} <span class="meta">${esc(first.netid !== first.name ? first.netid : '')}</span></div>` +
+      `<div class="meta">${esc([first.team, events, 'out since ' + when(oldest)].filter(Boolean).join(' · '))}</div></div>` +
+      (g.length > 1 ? `<button type="button" class="secondary" data-key="${esc(key)}">Check in all ${g.length}</button>` : '') + '</div>' +
+      g.map((o, i) => `<div class="row"><div class="grow"><span class="name">${esc(o.item)}</span> <span class="meta">×${esc(o.qty)}</span><div class="meta">${esc(o.office)}</div></div>` +
+        `<button type="button" class="secondary" data-key="${esc(key)}" data-i="${i}">Check in</button></div>`).join('') + '</div>';
   }).join('');
 }
 
 function renderRecent() {
   $('recent-empty').hidden = data.recent.length > 0;
-  $('recent').innerHTML = data.recent.map(l =>
-    `<div class="row"><span class="tag ${esc(l.status)}">${esc(l.status)}</span><div class="grow"><span class="name">${esc(l.item)}</span> <span class="meta">×${esc(l.qty)}</span>` +
-    `<div class="meta">${esc(l.name)} · ${esc(l.office)} · ${when(l.status === 'IN' ? l.in : l.out)}</div></div></div>`).join('');
+  $('recent').innerHTML = data.recent.map(e => {
+    const isIn = /check in/i.test(e.action);
+    const items = e.items.map(it => `${it.item} ×${it.qty}`).join(', ');
+    return `<div class="row"><span class="tag ${isIn ? 'IN' : 'OUT'}">${isIn ? 'IN' : 'OUT'}</span><div class="grow"><span class="name">${esc(items || '(no items)')}</span>` +
+      `<div class="meta">${esc([e.who, e.event, when(e.ts)].filter(Boolean).join(' · '))}</div></div></div>`;
+  }).join('');
 }
 
 $('out').onclick = async e => {
-  const btn = e.target.closest('button[data-ids]');
+  const btn = e.target.closest('button[data-key]');
   if (!btn) return;
-  const ids = btn.dataset.ids.split(',');
+  const group = data.out.filter(o => o.key === btn.dataset.key);
+  const lines = btn.dataset.i === undefined ? group : [group[btn.dataset.i]];
   $('out').querySelectorAll('button').forEach(b => b.disabled = true);
   btn.textContent = 'Checking in...';
   try {
-    await api('POST', { action: 'checkin', ids });
-    flash(`Checked in ${plural(ids.length, 'item')}.`, 'ok');
+    apply(await api('POST', { action: 'checkin', who: lines[0].who, items: lines.map(o => ({ office: o.office, item: o.item, qty: o.qty })) }));
+    flash(`Checked in ${plural(lines.length, 'item')}.`, 'ok');
   } catch (err) {
     flash('Check in failed: ' + err.message, 'err');
+    renderOut();
   }
-  await load();
 };
 
 // ---------- Load / submit ----------
 
 function render() {
+  renderTabs();
   renderItems();
   renderCart();
   renderOut();
   renderRecent();
   $('netids').innerHTML = Object.entries(data.people).map(([id, n]) => `<option value="${esc(id)}">${esc(n)}</option>`).join('');
-  $('events').innerHTML = data.events.map(e => `<option value="${esc(e)}">`).join('');
+  $('teams').innerHTML = data.teams.map(t => `<option value="${esc(t)}">`).join('');
+  $('events').innerHTML = data.events.map(ev => `<option value="${esc(ev)}">`).join('');
 }
 
 async function load() {
-  renderTabs();
-  $('items-status').className = 'status';
-  $('items-status').textContent = 'Loading...';
   try {
-    data = await api('GET', { office });
-    offices = data.config.offices;
-    office = data.office;
-    store.set('office', office);
-    document.title = data.config.title;
-    $('co-event').required = data.config.requireEvent;
-    $('co-event').placeholder = data.config.requireEvent ? 'Event (required)' : 'Event';
-    renderTabs();
-    render();
+    apply(await api('GET'));
   } catch (err) {
     $('items-status').className = 'status err';
-    $('items-status').textContent = 'Could not load: ' + err.message;
+    $('items-status').textContent = (data ? 'Showing saved copy. ' : '') + 'Could not load: ' + err.message;
   }
 }
 
 function flash(msg, cls) { $('co-status').className = 'status ' + cls; $('co-status').textContent = msg; }
 
-// Autofill: last-used person and event; a known NetID fills the name.
-$('co-name').value = store.get('name');
-$('co-netid').value = store.get('netid');
-$('co-event').value = store.get('event');
+// Autofill: last-used details; a known NetID fills the name.
+['name', 'netid', 'team', 'event'].forEach(k => { $('co-' + k).value = store.get(k); });
 $('co-netid').oninput = () => {
-  const n = data.people[$('co-netid').value.trim().toLowerCase()];
+  const n = data?.people[$('co-netid').value.trim().toLowerCase()];
   if (n) $('co-name').value = n;
 };
 
@@ -318,19 +362,16 @@ $('checkout').onsubmit = async e => {
   const btn = $('co-btn');
   btn.disabled = true;
   btn.textContent = 'Checking out...';
-  const body = {
-    action: 'checkout',
-    items: cart.map(c => ({ office: c.office, item: c.item, box: c.box, qty: c.qty })),
-    name: $('co-name').value, netid: $('co-netid').value, event: $('co-event').value,
-  };
+  const body = { action: 'checkout', items: cart.map(c => ({ office: c.office, item: c.item, qty: c.qty })) };
+  ['name', 'netid', 'team', 'event'].forEach(k => { body[k] = $('co-' + k).value.trim(); });
   try {
-    await api('POST', body);
-    ['name', 'netid', 'event'].forEach(k => store.set(k, body[k]));
-    flash(`Checked out ${plural(body.items.length, 'item')} to ${body.name.trim()}.`, 'ok');
+    const fresh = await api('POST', body);
+    ['name', 'netid', 'team', 'event'].forEach(k => store.set(k, body[k]));
     cart = [];
+    store.set('cart', '[]');
     $('filter').value = '';
-    saveCart();
-    await load();
+    apply(fresh);
+    flash(`Checked out ${plural(body.items.length, 'item')} to ${body.name}.`, 'ok');
   } catch (err) {
     flash('Check out failed: ' + err.message, 'err');
     renderCart();
@@ -348,6 +389,9 @@ if ('IntersectionObserver' in window) {
 }
 
 if (window.ADMIN_URL) { $('admin-link').href = ADMIN_URL; $('admin-link').hidden = false; }
+// Saved copy from an older version of the page has a different shape.
+if (data && !Array.isArray(data.teams)) data = null;
+if (data) { apply(data); $('items-status').textContent += ' · updating…'; }
 renderCart();
 load();
 </script>

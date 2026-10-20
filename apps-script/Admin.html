@@ -45,6 +45,9 @@
   .field label { font-size: 13px; font-weight: 600; }
   .check { display: flex; gap: 8px; align-items: center; margin-bottom: 14px; font-size: 14px; }
   .note { background: var(--row); border: 1px solid var(--line); border-radius: 4px; padding: 10px 12px; font-size: 14px; max-width: 720px; }
+  table.inv input { min-width: 90px; }
+  table.inv input.wide { min-width: 200px; }
+  #add-row > input, #add-row > select { min-width: 110px; flex: 1; }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -66,11 +69,18 @@
     <section id="tab-log">
       <div class="bar">
         <input id="log-q" placeholder="Search name, NetID, item, event">
-        <select id="log-status"><option value="">All statuses</option><option>OUT</option><option>IN</option></select>
         <select id="log-office"></select>
         <button class="small" id="log-reload">Reload</button>
       </div>
-      <div class="muted" id="log-count"></div>
+      <h2>Checked out now</h2>
+      <p class="muted">Reusable items people still have (take-outs minus check-ins, from the site and the Google Form).</p>
+      <div class="wrap" id="out"></div>
+      <h2>Activity</h2>
+      <div class="bar">
+        <select id="log-action"><option value="">All actions</option><option>Take out</option><option>Check in</option></select>
+        <span class="muted" id="log-count"></span>
+      </div>
+      <p class="muted">Every row of <b>Form Responses 1</b>, newest first. Delete removes the row from the sheet, which also undoes its effect on Total Out.</p>
       <div class="wrap" id="log"></div>
     </section>
 
@@ -80,13 +90,18 @@
         <input id="inv-q" placeholder="Filter rows">
         <button class="small" id="inv-reload">Reload</button>
       </div>
-      <p class="muted">Edits go straight into the office's sheet tab (columns A–C). Changes show on the check-out site right away.</p>
+      <p class="muted">Edits go straight into the office's sheet tab. Total Out and Current Qty are formulas and can't be edited here.</p>
       <div class="wrap" id="rows"></div>
       <h2>Add item</h2>
       <form id="add-row" class="bar">
-        <input id="add-a" placeholder="Box / Zone">
-        <input id="add-b" placeholder="Item name">
-        <input id="add-c" placeholder="Quantity">
+        <input data-c="1" placeholder="ID">
+        <input data-c="2" placeholder="Item name" required>
+        <select data-c="3"><option>Reusable</option><option>Consumable</option></select>
+        <input data-c="4" placeholder="Category">
+        <input data-c="5" placeholder="Location">
+        <input data-c="6" placeholder="Unit">
+        <input data-c="7" placeholder="Starting qty" inputmode="numeric">
+        <input data-c="10" placeholder="Notes">
         <button class="primary" type="submit">Add</button>
       </form>
     </section>
@@ -96,7 +111,7 @@
       <label class="check"><input type="checkbox" id="set-event"> Require an event on every check-out</label>
 
       <h2>Offices</h2>
-      <p class="muted">Each office is a tab on the check-out site. It reads items from columns A–C of the sheet tab you pick, starting at "first row". Renaming an office leaves its old checkouts under the old name.</p>
+      <p class="muted">Each office is a tab on the check-out site. It reads items from the sheet tab you pick, starting at "first row" (2 = just below the header). The tab's Total Out formula tells the site which Form Responses columns belong to it.</p>
       <div class="wrap">
         <table>
           <thead><tr><th>Office name</th><th>Sheet tab</th><th>First row</th><th></th></tr></thead>
@@ -127,7 +142,7 @@ const when = iso => { const d = new Date(iso); return isNaN(d) ? '' : d.toLocale
 const run = (action, payload) => new Promise((resolve, reject) =>
   google.script.run.withSuccessHandler(resolve).withFailureHandler(reject).adminApi(action, payload || {}));
 
-const state = { config: null, sheets: [], log: [], rows: [], editing: null, draft: null, email: '' };
+const state = { config: null, sheets: [], log: [], out: [], rows: [], draft: null, email: '' };
 
 function status(msg, cls) {
   $('status').className = 'status ' + (cls || '');
@@ -175,64 +190,73 @@ $('tabs').onclick = e => {
 // ---------- Checkouts ----------
 
 async function loadLog() {
-  await act('Loading checkouts', async () => { state.log = await run('log'); });
+  await act('Loading activity', async () => {
+    const d = await run('log');
+    state.log = d.log;
+    state.out = d.out;
+  });
   renderLog();
 }
 
+const matches = (q, ...parts) => !q || parts.join(' ').toLowerCase().includes(q);
+
 function renderLog() {
   const q = $('log-q').value.trim().toLowerCase();
-  const st = $('log-status').value;
   const off = $('log-office').value;
-  const rows = state.log.filter(l =>
-    (!st || l.status === st) && (!off || l.office === off) &&
-    (!q || [l.name, l.netid, l.item, l.event, l.box].join(' ').toLowerCase().includes(q)));
-  $('log-count').textContent = `${rows.length} of ${state.log.length} checkouts`;
-  if (!rows.length) { $('log').innerHTML = '<p class="muted">Nothing here.</p>'; return; }
-  $('log').innerHTML = `<table><thead><tr><th>Out</th><th>Office</th><th>Item</th><th>Box / Zone</th><th>Qty</th><th>Name</th><th>NetID</th><th>Event</th><th>Status</th><th></th></tr></thead><tbody>` +
-    rows.map(l => l.id === state.editing ? editRow(l) : viewRow(l)).join('') + '</tbody></table>';
+  const act_ = $('log-action').value;
+
+  const out = state.out.filter(o => (!off || o.office === off) && matches(q, o.who, o.item, o.event, o.team));
+  $('out').innerHTML = out.length
+    ? `<table><thead><tr><th>Person</th><th>Item</th><th>Qty</th><th>Office</th><th>Team / event</th><th>Out since</th><th></th></tr></thead><tbody>` +
+      out.map(o => `<tr data-key="${esc(o.key)}" data-office="${esc(o.office)}" data-item="${esc(o.item)}"><td>${esc(o.who)}</td><td>${esc(o.item)}</td><td>${esc(o.qty)}</td>` +
+        `<td>${esc(o.office)}</td><td>${esc([o.team, o.event].filter(Boolean).join(' · '))}</td><td>${when(o.since)}</td>` +
+        `<td class="actions"><button class="small" data-act="checkin">Check in</button></td></tr>`).join('') + '</tbody></table>'
+    : '<p class="muted">Nothing checked out.</p>';
+
+  const log = state.log.filter(e => (!act_ || e.action === act_) &&
+    (!off || e.items.some(it => it.office === off)) &&
+    matches(q, e.who, e.team, e.event, e.items.map(it => it.item).join(' ')));
+  $('log-count').textContent = `${log.length} of ${state.log.length} rows`;
+  $('log').innerHTML = log.length
+    ? `<table><thead><tr><th>When</th><th>Person</th><th>Action</th><th>Items</th><th>Team / event</th><th>Row</th><th></th></tr></thead><tbody>` +
+      log.map(e => `<tr data-row="${e.row}"><td>${when(e.ts)}</td><td>${esc(e.who)}</td>` +
+        `<td><span class="tag ${/check in/i.test(e.action) ? 'IN' : 'OUT'}">${esc(e.action || '—')}</span></td>` +
+        `<td>${e.items.map(it => `${esc(it.item)} ×${esc(it.qty)} <span class="muted">${esc(it.office)}</span>`).join('<br>')}</td>` +
+        `<td>${esc([e.team, e.event].filter(Boolean).join(' · '))}${e.notes ? `<br><span class="muted">${esc(e.notes)}</span>` : ''}</td>` +
+        `<td class="muted">${e.row}</td><td class="actions"><button class="small danger" data-act="delete">Delete</button></td></tr>`).join('') + '</tbody></table>'
+    : '<p class="muted">Nothing here.</p>';
 }
 
-function viewRow(l) {
-  return `<tr data-id="${esc(l.id)}"><td>${when(l.out)}</td><td>${esc(l.office)}</td><td>${esc(l.item)}</td><td>${esc(l.box)}</td><td>${esc(l.qty)}</td>` +
-    `<td>${esc(l.name)}</td><td>${esc(l.netid)}</td><td>${esc(l.event)}</td>` +
-    `<td><span class="tag ${esc(l.status)}">${esc(l.status)}</span>${l.status === 'IN' ? `<br><span class="muted">${when(l.in)}</span>` : ''}</td>` +
-    `<td class="actions">${l.status === 'OUT' ? '<button class="small" data-act="checkin">Check in</button>' : ''}` +
-    `<button class="small" data-act="edit">Edit</button><button class="small danger" data-act="delete">Delete</button></td></tr>`;
-}
-
-function editRow(l) {
-  const input = (k, type) => `<input data-k="${k}" type="${type || 'text'}" value="${esc(l[k])}">`;
-  return `<tr data-id="${esc(l.id)}"><td>${when(l.out)}</td><td><select data-k="office">${officeOptions(l.office)}</select></td>` +
-    `<td>${input('item')}</td><td>${input('box')}</td><td>${input('qty', 'number')}</td><td>${input('name')}</td><td>${input('netid')}</td><td>${input('event')}</td>` +
-    `<td><select data-k="status"><option${l.status === 'OUT' ? ' selected' : ''}>OUT</option><option${l.status === 'IN' ? ' selected' : ''}>IN</option></select></td>` +
-    `<td class="actions"><button class="primary" data-act="save">Save</button><button class="small" data-act="cancel">Cancel</button></td></tr>`;
-}
-
-$('log').onclick = async e => {
-  const btn = e.target.closest('button[data-act]');
+$('out').onclick = async e => {
+  const btn = e.target.closest('button[data-act=checkin]');
   if (!btn) return;
   const tr = btn.closest('tr');
-  const id = tr.dataset.id;
-  const a = btn.dataset.act;
-  if (a === 'edit') { state.editing = id; return renderLog(); }
-  if (a === 'cancel') { state.editing = null; return renderLog(); }
-  if (a === 'delete' && !armed(btn)) return;
+  const o = state.out.find(x => x.key === tr.dataset.key && x.office === tr.dataset.office && x.item === tr.dataset.item);
   btn.disabled = true;
-  let ok;
-  if (a === 'checkin') ok = await act('Checking in', () => run('checkin', { id }));
-  if (a === 'delete') ok = await act('Deleting checkout', () => run('deleteLog', { id }));
-  if (a === 'save') {
-    const p = { id };
-    tr.querySelectorAll('[data-k]').forEach(el => p[el.dataset.k] = el.value);
-    ok = await act('Saving checkout', () => run('updateLog', p));
-    if (ok) state.editing = null;
-  }
+  const ok = await act(`Checking in ${o.item} for ${o.who}`, () => run('checkin', { who: o.who, items: [{ office: o.office, item: o.item, qty: o.qty }] }));
   if (ok) await loadLog(); else btn.disabled = false;
 };
-['log-q', 'log-status', 'log-office'].forEach(id => $(id).oninput = renderLog);
+
+$('log').onclick = async e => {
+  const btn = e.target.closest('button[data-act=delete]');
+  if (!btn || !armed(btn)) return;
+  const entry = state.log.find(x => x.row === Number(btn.closest('tr').dataset.row));
+  btn.disabled = true;
+  const ok = await act('Deleting row ' + entry.row, () => run('deleteLog', { row: entry.row, ts: entry.ts, who: entry.who }));
+  if (ok) await loadLog(); else btn.disabled = false;
+};
+['log-q', 'log-action', 'log-office'].forEach(id => $(id).oninput = renderLog);
 $('log-reload').onclick = loadLog;
 
 // ---------- Inventory ----------
+
+// Sheet columns shown in the editor (1-based); 8 and 9 are formulas.
+const INV_COLUMNS = [
+  [1, 'ID'], [2, 'Item name'], [3, 'Type'], [4, 'Category'], [5, 'Location'], [6, 'Unit'],
+  [7, 'Starting qty'], [8, 'Total out'], [9, 'Current qty'], [10, 'Notes'],
+];
+const EDITABLE = [1, 2, 3, 4, 5, 6, 7, 10];
+const editableValues = values => EDITABLE.map(c => values[c - 1]);
 
 async function loadRows() {
   const office = $('inv-office').value;
@@ -244,20 +268,21 @@ function renderRows() {
   const q = $('inv-q').value.trim().toLowerCase();
   const rows = state.rows.filter(r => !q || r.values.join(' ').toLowerCase().includes(q));
   if (!rows.length) { $('rows').innerHTML = '<p class="muted">No rows.</p>'; return; }
-  $('rows').innerHTML = `<table><thead><tr><th>Row</th><th style="width:20%">Box / Zone (A)</th><th style="width:35%">Description (B)</th><th>Items / Quantity (C)</th><th></th></tr></thead><tbody>` +
+  $('rows').innerHTML = `<table class="inv"><thead><tr><th>Row</th>${INV_COLUMNS.map(([, l]) => `<th>${l}</th>`).join('')}<th></th></tr></thead><tbody>` +
     rows.map(r => `<tr data-row="${r.row}"><td class="muted">${r.row}</td>` +
-      r.values.map((v, i) => `<td><textarea rows="1" data-i="${i}">${esc(v)}</textarea></td>`).join('') +
+      INV_COLUMNS.map(([c]) => EDITABLE.includes(c)
+        ? `<td><input data-c="${c}" value="${esc(r.values[c - 1])}"${c === 2 ? ' class="wide"' : ''}></td>`
+        : `<td class="muted">${esc(r.values[c - 1])}</td>`).join('') +
       `<td class="actions"><button class="primary" data-act="save" disabled>Save</button><button class="small danger" data-act="delete">Delete</button></td></tr>`).join('') +
     '</tbody></table>';
 }
 
 const rowFor = tr => state.rows.find(r => r.row === Number(tr.dataset.row));
+const rowInputs = tr => EDITABLE.map(c => tr.querySelector(`[data-c="${c}"]`).value);
 
 $('rows').oninput = e => {
   const tr = e.target.closest('tr');
-  const r = rowFor(tr);
-  const values = [...tr.querySelectorAll('textarea')].map(t => t.value);
-  tr.querySelector('[data-act=save]').disabled = JSON.stringify(values) === JSON.stringify(r.values);
+  tr.querySelector('[data-act=save]').disabled = JSON.stringify(rowInputs(tr)) === JSON.stringify(editableValues(rowFor(tr).values));
 };
 
 $('rows').onclick = async e => {
@@ -268,18 +293,18 @@ $('rows').onclick = async e => {
   const office = $('inv-office').value;
   if (btn.dataset.act === 'delete' && !armed(btn)) return;
   btn.disabled = true;
+  const original = editableValues(r.values);
   const ok = btn.dataset.act === 'save'
-    ? await act('Saving row ' + r.row, () => run('saveRow', { office, row: r.row, original: r.values, values: [...tr.querySelectorAll('textarea')].map(t => t.value) }))
-    : await act('Deleting row ' + r.row, () => run('deleteRow', { office, row: r.row, original: r.values }));
+    ? await act('Saving row ' + r.row, () => run('saveRow', { office, row: r.row, original, values: rowInputs(tr) }))
+    : await act('Deleting row ' + r.row, () => run('deleteRow', { office, row: r.row, original }));
   if (ok) await loadRows(); else btn.disabled = false;
 };
 
 $('add-row').onsubmit = async e => {
   e.preventDefault();
-  const values = ['add-a', 'add-b', 'add-c'].map(id => $(id).value.trim());
-  if (!values[1] && !values[2]) return status('Enter an item name or quantity.', 'err');
-  const ok = await act('Adding item', () => run('addRow', { office: $('inv-office').value, values }));
-  if (ok) { ['add-a', 'add-b', 'add-c'].forEach(id => $(id).value = ''); await loadRows(); }
+  const fields = EDITABLE.map(c => $('add-row').querySelector(`[data-c="${c}"]`));
+  const ok = await act('Adding item', () => run('addRow', { office: $('inv-office').value, values: fields.map(f => f.value.trim()) }));
+  if (ok) { fields.forEach(f => { if (f.tagName === 'INPUT') f.value = ''; }); await loadRows(); }
 };
 $('inv-office').onchange = loadRows;
 $('inv-q').oninput = renderRows;

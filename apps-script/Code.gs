@@ -6,17 +6,33 @@
  * See README.md.
  */
 
-const SPREADSHEET_ID = '18dOTIriWlQVI4ZQFUH_BV6XI2x2KFmoa9ijRz4nNkV4';
-const LOG_SHEET = 'Checkout Log';
-const LOG_HEADERS = ['ID', 'Checked Out', 'Office', 'Item', 'Box / Zone', 'Qty', 'Name', 'NetID', 'Event', 'Status', 'Checked In'];
+const SPREADSHEET_ID = '1EvEk_jlDcMM_yMkKPpHd5VjLJ0KWqfQkATLVHVpzJVQ';
+
+// Check-outs and check-ins are written as rows in the Google Form's response
+// sheet, in the form's own format, so each inventory tab's Total Out /
+// Current Qty formulas count them alongside real form submissions.
+const FORM_SHEET = 'Form Responses 1';
+const FORM_COLS = 66; // A..BN, through "Notes?"
+const ITEMS_PER_BLOCK = 10;
+const TAKE_OUT = 'Take out';
+const CHECK_IN = 'Check in';
+
+// Inventory tab columns (1-based). Total Out and Current Qty are formulas.
+const COL = { id: 1, name: 2, type: 3, category: 4, location: 5, unit: 6, start: 7, out: 8, qty: 9, notes: 10 };
+const INV_COLS = 10;
+const EDITABLE = [1, 2, 3, 4, 5, 6, 7, 10]; // everything but the formulas
+
+const CACHE_KEY = 'data';
+const CACHE_SECONDS = 20;
 
 // Used until an admin saves settings in the portal.
 const DEFAULT_CONFIG = {
   title: 'Inventory Check Out',
   requireEvent: false,
   offices: [
-    { name: 'OFSA Office', sheet: 'OFSA Basement Inventory', firstRow: 3 },
-    { name: 'DM Office', sheet: 'DM Office', firstRow: 3 },
+    { name: 'Warehouse', sheet: 'Warehouse', firstRow: 2 },
+    { name: 'OFSA Office', sheet: 'OFSA', firstRow: 2 },
+    { name: 'DM Office', sheet: 'DM Office', firstRow: 2 },
   ],
 };
 
@@ -26,17 +42,19 @@ function doGet(e) {
       .setTitle('Inventory Admin')
       .addMetaTag('viewport', 'width=device-width, initial-scale=1');
   }
-  return handle_(() => getData_(e.parameter.office));
+  return handle_(() => getData_(false));
 }
 
+// Writes return the fresh data, so the page needs only one round trip.
 function doPost(e) {
   return handle_(() => {
     const body = JSON.parse(e.postData.contents);
-    return withLock_(() => {
+    withLock_(() => {
       if (body.action === 'checkout') return checkout_(body);
       if (body.action === 'checkin') return checkin_(body);
       throw new Error('Unknown action: ' + body.action);
     });
+    return getData_(true);
   });
 }
 
@@ -54,21 +72,40 @@ function withLock_(fn) {
   const lock = LockService.getScriptLock();
   lock.waitLock(10000);
   try {
-    return fn();
+    const result = fn();
+    invalidate_();
+    return result;
   } finally {
     lock.releaseLock();
   }
 }
 
+// After a write: recalculate formulas and drop the cached page data.
+function invalidate_() {
+  SpreadsheetApp.flush();
+  CacheService.getScriptCache().remove(CACHE_KEY);
+}
+
+let SS;
 function ss_() {
-  return SpreadsheetApp.openById(SPREADSHEET_ID);
+  return SS || (SS = SpreadsheetApp.openById(SPREADSHEET_ID));
 }
 
 // ---------- Settings ----------
 
+const CONFIG_KEY = 'config:' + SPREADSHEET_ID;
+
 function getConfig_() {
-  const raw = PropertiesService.getScriptProperties().getProperty('config');
-  return raw ? JSON.parse(raw) : DEFAULT_CONFIG;
+  const props = PropertiesService.getScriptProperties();
+  const raw = props.getProperty(CONFIG_KEY);
+  if (raw) return JSON.parse(raw);
+  // First run on this spreadsheet: keep the admin list from the previous one.
+  const legacy = JSON.parse(props.getProperty('config') || '{}');
+  return Object.assign({}, DEFAULT_CONFIG, { admins: legacy.admins || [] });
+}
+
+function writeConfig_(cfg) {
+  PropertiesService.getScriptProperties().setProperty(CONFIG_KEY, JSON.stringify(cfg));
 }
 
 function findOffice_(name) {
@@ -82,12 +119,13 @@ function saveConfig_(c) {
   const offices = (c.offices || []).map(o => ({
     name: String(o.name || '').trim(),
     sheet: String(o.sheet || ''),
-    firstRow: Math.max(1, Math.floor(Number(o.firstRow)) || 1),
+    firstRow: Math.max(1, Math.floor(Number(o.firstRow)) || 2),
   }));
   if (!offices.length) throw new Error('Add at least one office.');
   offices.forEach(o => {
     if (!o.name) throw new Error('Every office needs a name.');
     if (!sheetNames.includes(o.sheet)) throw new Error('Sheet tab not found: ' + o.sheet);
+    formBlock_(ss_().getSheetByName(o.sheet), o.firstRow);
   });
   if (new Set(offices.map(o => o.name)).size !== offices.length) throw new Error('Office names must be different.');
   const cfg = {
@@ -100,11 +138,7 @@ function saveConfig_(c) {
   return cfg;
 }
 
-function writeConfig_(cfg) {
-  PropertiesService.getScriptProperties().setProperty('config', JSON.stringify(cfg));
-}
-
-// ---------- Inventory ----------
+// ---------- Inventory tabs ----------
 
 function sheetFor_(office) {
   const sh = ss_().getSheetByName(office.sheet);
@@ -112,62 +146,79 @@ function sheetFor_(office) {
   return sh;
 }
 
-// Columns A:C of every row from firstRow down, blank rows dropped.
+// Rows from firstRow down with anything in the editable columns.
 function readRows_(office) {
   const sh = sheetFor_(office);
-  const first = Number(office.firstRow) || 1;
+  const first = Number(office.firstRow) || 2;
   const last = sh.getLastRow();
   if (last < first) return [];
-  return sh.getRange(first, 1, last - first + 1, 3).getDisplayValues()
+  return sh.getRange(first, 1, last - first + 1, INV_COLS).getDisplayValues()
     .map((values, i) => ({ row: first + i, values }))
-    .filter(r => r.values.some(v => String(v).trim()));
+    .filter(r => EDITABLE.some(c => String(r.values[c - 1]).trim()));
 }
 
-// Turns one messy inventory row into one or more {name, box, qty} items.
-function parseRow_(box, desc, qty) {
-  box = String(box || '').trim();
-  desc = String(desc || '').trim();
-  qty = String(qty || '').trim();
-  if (!desc && !qty) return [];
+// Items on an office tab, plus the form-sheet column holding its "Item 1".
+function readOffice_(office) {
+  const sh = sheetFor_(office);
+  const items = readRows_(office)
+    .filter(r => r.values[COL.name - 1].trim())
+    .map(r => {
+      const v = r.values;
+      return {
+        name: v[COL.name - 1].trim(), type: v[COL.type - 1], category: v[COL.category - 1],
+        location: v[COL.location - 1], unit: v[COL.unit - 1], qty: v[COL.qty - 1],
+      };
+    });
+  return { name: office.name, items, block: formBlock_(sh, Number(office.firstRow) || 2) };
+}
 
-  // "Yellow Wristband/Orange Wristband" with "80/105" -> two items.
-  if (desc) {
-    const names = desc.split('/').map(s => s.trim()).filter(String);
-    const qtys = qty.split('/').map(s => s.trim());
-    if (names.length > 1 && names.length === qtys.length) {
-      return names.map((n, i) => ({ name: n, box, qty: qtys[i] }));
-    }
-    return [{ name: desc, box, qty }];
-  }
+// Finds the office's item columns from its Total Out formula, e.g.
+// ('Form Responses 1'!$Z$2:$AR=B2) -> column Z.
+function formBlock_(sh, firstRow) {
+  const formula = sh.getRange(firstRow, COL.out).getFormula();
+  const m = formula.match(/'Form Responses 1'!\$([A-Z]+)\$\d+:\$[A-Z]+\s*=\s*B\d/);
+  if (!m) throw new Error(`Can't find the form columns in ${sh.getName()}!H${firstRow}'s Total Out formula.`);
+  return m[1].split('').reduce((n, ch) => n * 26 + ch.charCodeAt(0) - 64, 0);
+}
 
-  // No description: "10 unused FTK ribbons, 3 rolls of raffle tickets" -> one item per part.
-  return qty.split(/[,;]/).map(s => s.trim()).filter(String).map(part => {
-    const m = part.match(/^(~?\d[\d+]*)\s+(.*)$/);
-    return m ? { name: m[2], box, qty: m[1] } : { name: part, box, qty: '' };
-  });
+function stockNumber_(qty) {
+  const n = Number(String(qty).replace(/,/g, ''));
+  return isFinite(n) && String(qty).trim() !== '' ? n : null;
 }
 
 // Guards admin edits against rows that moved since the portal loaded them.
 function checkRow_(sh, office, row, original) {
-  if (row < (Number(office.firstRow) || 1)) throw new Error('Row is above the inventory.');
-  const current = sh.getRange(row, 1, 1, 3).getDisplayValues()[0];
-  if (JSON.stringify(current) !== JSON.stringify(original)) {
+  if (row < (Number(office.firstRow) || 2)) throw new Error('Row is above the inventory.');
+  const current = sh.getRange(row, 1, 1, INV_COLS).getDisplayValues()[0];
+  if (JSON.stringify(EDITABLE.map(c => current[c - 1])) !== JSON.stringify(original)) {
     throw new Error('That row changed in the sheet since you loaded it. Reload and try again.');
   }
+}
+
+// values: the EDITABLE columns, in order (A–G, then J).
+function writeRow_(sh, row, values) {
+  sh.getRange(row, 1, 1, 7).setValues([values.slice(0, 7)]);
+  sh.getRange(row, COL.notes).setValue(values[7]);
 }
 
 function saveRow_(p) {
   const office = findOffice_(p.office);
   const sh = sheetFor_(office);
   checkRow_(sh, office, p.row, p.original);
-  sh.getRange(p.row, 1, 1, 3).setValues([p.values]);
+  writeRow_(sh, p.row, p.values);
 }
 
 function addRow_(p) {
+  if (!String(p.values[1] || '').trim()) throw new Error('Enter an item name.');
   const office = findOffice_(p.office);
+  const sh = sheetFor_(office);
   const rows = readRows_(office);
-  const row = rows.length ? rows[rows.length - 1].row + 1 : Number(office.firstRow) || 1;
-  sheetFor_(office).getRange(row, 1, 1, 3).setValues([p.values]);
+  const row = rows.length ? rows[rows.length - 1].row + 1 : Number(office.firstRow) || 2;
+  writeRow_(sh, row, p.values);
+  // New rows at the bottom may not have the Total Out / Current Qty formulas yet.
+  if (!sh.getRange(row, COL.out).getFormula() && row > (Number(office.firstRow) || 2)) {
+    sh.getRange(row - 1, COL.out, 1, 2).copyTo(sh.getRange(row, COL.out, 1, 2));
+  }
 }
 
 function deleteRow_(p) {
@@ -177,113 +228,182 @@ function deleteRow_(p) {
   sh.deleteRow(p.row);
 }
 
-// ---------- Checkout log ----------
+// ---------- Form log ----------
 
-function logSheet_() {
-  const ss = ss_();
-  let sh = ss.getSheetByName(LOG_SHEET);
-  if (!sh) {
-    sh = ss.insertSheet(LOG_SHEET);
-    sh.appendRow(LOG_HEADERS);
-    sh.setFrozenRows(1);
-    sh.getRange(1, 1, 1, LOG_HEADERS.length).setFontWeight('bold');
-  }
+function formSheet_() {
+  const sh = ss_().getSheetByName(FORM_SHEET);
+  if (!sh) throw new Error('Sheet tab not found: ' + FORM_SHEET);
   return sh;
 }
 
-function logRows_() {
-  const sh = logSheet_();
+// Every form row as {row, ts, who, team, action, event, notes, items: [{office, item, qty}]}.
+function readForm_(offices) {
+  const sh = formSheet_();
   const n = sh.getLastRow() - 1;
   if (n < 1) return [];
-  return sh.getRange(2, 1, n, LOG_HEADERS.length).getValues().map((r, i) => ({
-    row: i + 2,
-    id: String(r[0]),
-    out: r[1] instanceof Date ? r[1].toISOString() : String(r[1]),
-    office: r[2], item: r[3], box: r[4], qty: r[5],
-    name: r[6], netid: r[7], event: r[8], status: r[9],
-    in: r[10] instanceof Date ? r[10].toISOString() : String(r[10] || ''),
-  }));
+  return sh.getRange(2, 1, n, FORM_COLS).getValues().map((r, i) => {
+    const items = [];
+    offices.forEach(o => {
+      for (let k = 0; k < ITEMS_PER_BLOCK; k++) {
+        const item = String(r[o.block - 1 + 2 * k] || '').trim();
+        if (item) items.push({ office: o.name, item, qty: Number(r[o.block + 2 * k]) || 0 });
+      }
+    });
+    return {
+      row: i + 2,
+      ts: r[0] instanceof Date ? r[0].toISOString() : String(r[0]),
+      who: String(r[1] || '').trim(), team: String(r[2] || '').trim(),
+      action: String(r[3] || '').trim(), event: String(r[4] || '').trim(),
+      notes: String(r[FORM_COLS - 1] || '').trim(), items,
+    };
+  }).filter(e => e.who || e.items.length);
 }
 
-function findLog_(id) {
-  const entry = logRows_().find(l => l.id === String(id));
-  if (!entry) throw new Error('Checkout not found');
-  return entry;
+// "Emma F, egf48" -> {name: 'Emma F', netid: 'egf48'}; "egf48" -> {name: 'egf48', netid: 'egf48'}.
+function person_(who) {
+  const m = who.match(/^(.*?),\s*([^,\s]+)\s*$/);
+  if (m) return { name: m[1].trim() || m[2], netid: m[2].toLowerCase() };
+  return { name: who, netid: /^[a-z]+\d+$/i.test(who) ? who.toLowerCase() : '' };
 }
 
-function getData_(officeName) {
+const personKey_ = who => person_(who).netid || who.toLowerCase();
+
+// Reusable items each person still has: take-outs minus check-ins.
+function outstanding_(log, typeOf) {
+  const map = new Map();
+  log.forEach(e => {
+    const sign = e.action === TAKE_OUT ? 1 : e.action === CHECK_IN ? -1 : 0;
+    if (!sign) return;
+    const key = personKey_(e.who);
+    e.items.forEach(it => {
+      const k = [key, it.office, it.item].join('|');
+      if (!map.has(k)) map.set(k, { key, who: e.who, office: it.office, item: it.item, qty: 0, since: e.ts, event: '', team: '' });
+      const o = map.get(k);
+      if (sign > 0) {
+        if (o.qty <= 0) o.since = e.ts;
+        Object.assign(o, { who: e.who, event: e.event || o.event, team: e.team || o.team });
+      }
+      o.qty += sign * it.qty;
+    });
+  });
+  return [...map.values()]
+    .filter(o => o.qty > 0 && !/consum/i.test(typeOf(o.office, o.item)))
+    .map(o => Object.assign(o, person_(o.who)));
+}
+
+function snapshot_() {
   const cfg = getConfig_();
-  const office = cfg.offices.find(o => o.name === officeName) || cfg.offices[0];
-  if (!office) throw new Error('No offices are set up yet.');
+  const offices = cfg.offices.map(readOffice_);
+  const types = {};
+  offices.forEach(o => o.items.forEach(it => { types[o.name + '|' + it.name] = it.type; }));
+  const log = readForm_(offices);
+  return { cfg, offices, log, out: outstanding_(log, (office, item) => types[office + '|' + item] || '') };
+}
 
-  const items = [];
-  readRows_(office).forEach(r => {
-    parseRow_(r.values[0], r.values[1], r.values[2]).forEach(it => items.push(Object.assign(it, { row: r.row })));
-  });
-
-  // Log, people and events cover every office: carts can span offices,
-  // and autofill should work on any tab.
-  const log = logRows_();
+function getData_(fresh) {
+  const cache = CacheService.getScriptCache();
+  if (!fresh) {
+    const hit = cache.get(CACHE_KEY);
+    if (hit) return JSON.parse(hit);
+  }
+  const { cfg, offices, log, out } = snapshot_();
   const people = {};
-  log.forEach(l => { if (l.netid) people[String(l.netid).toLowerCase()] = l.name; });
-  const events = Array.from(new Set(log.map(l => l.event).filter(String)));
-
-  return {
-    config: { title: cfg.title, requireEvent: !!cfg.requireEvent, offices: cfg.offices.map(o => o.name) },
-    office: office.name,
-    items,
-    out: log.filter(l => l.status === 'OUT').reverse(),
-    recent: log.slice(-25).reverse(),
+  const events = new Set();
+  const teams = new Set();
+  log.forEach(e => {
+    const p = person_(e.who);
+    if (p.netid && p.name !== p.netid) people[p.netid] = p.name;
+    if (e.event) events.add(e.event);
+    if (e.team) teams.add(e.team);
+  });
+  const data = {
+    config: { title: cfg.title, requireEvent: !!cfg.requireEvent, offices: offices.map(o => o.name) },
+    items: Object.fromEntries(offices.map(o => [o.name, o.items])),
+    out: out.sort((a, b) => (a.since < b.since ? 1 : -1)),
+    recent: log.slice(-30).reverse().map(e => ({ ts: e.ts, who: e.who, action: e.action, event: e.event, items: e.items })),
     people,
-    events,
+    events: [...events],
+    teams: [...teams],
   };
+  try {
+    cache.put(CACHE_KEY, JSON.stringify(data), CACHE_SECONDS);
+  } catch (err) {
+    // Over the 100 KB cache limit: serve uncached.
+  }
+  return data;
 }
 
-// Takes a cart (`items`: [{office, item, box, qty}]) or a single item; one log row per item.
+// Appends form rows: up to 10 items per office per row, like the form does.
+function writeForm_(action, who, team, event, items, offices) {
+  const blocks = Object.fromEntries(offices.map(o => [o.name, o.block]));
+  const byOffice = {};
+  items.forEach(it => (byOffice[it.office] = byOffice[it.office] || []).push(it));
+  const rows = [];
+  const now = new Date();
+  for (let r = 0; ; r++) {
+    const row = new Array(FORM_COLS).fill('');
+    let any = false;
+    Object.keys(byOffice).forEach(office => {
+      byOffice[office].slice(r * ITEMS_PER_BLOCK, (r + 1) * ITEMS_PER_BLOCK).forEach((it, k) => {
+        row[blocks[office] - 1 + 2 * k] = it.item;
+        row[blocks[office] + 2 * k] = it.qty;
+        any = true;
+      });
+    });
+    if (!any) break;
+    Object.assign(row, { 0: now, 1: who, 2: team || '', 3: action, 4: event || '', [FORM_COLS - 1]: 'Via check-out site' });
+    rows.push(row);
+  }
+  const sh = formSheet_();
+  sh.getRange(sh.getLastRow() + 1, 1, rows.length, FORM_COLS).setValues(rows);
+}
+
+// Same office + item twice in one request -> one line with the total.
+function mergeItems_(items) {
+  const merged = new Map();
+  (items || []).forEach(it => {
+    const line = { office: String(it.office || ''), item: String(it.item || '').trim(), qty: Math.floor(Number(it.qty)) || 0 };
+    if (!line.item) throw new Error('Missing item');
+    if (line.qty < 1) throw new Error('Quantity must be at least 1: ' + line.item);
+    const k = line.office + '|' + line.item;
+    if (merged.has(k)) merged.get(k).qty += line.qty; else merged.set(k, line);
+  });
+  if (!merged.size) throw new Error('No items selected');
+  return [...merged.values()];
+}
+
 function checkout_(b) {
-  const required = ['name', 'netid'].concat(getConfig_().requireEvent ? ['event'] : []);
-  required.forEach(k => {
-    if (!String(b[k] || '').trim()) throw new Error('Missing ' + k);
-  });
-  const items = b.items || [{ office: b.office, item: b.item, box: b.box, qty: b.qty }];
-  if (!items.length) throw new Error('Nothing to check out');
+  const cfg = getConfig_();
+  const name = String(b.name || '').trim();
+  const netid = String(b.netid || '').trim().toLowerCase();
+  if (!name) throw new Error('Missing name');
+  if (!netid) throw new Error('Missing NetID');
+  if (cfg.requireEvent && !String(b.event || '').trim()) throw new Error('Missing event');
+  const items = mergeItems_(b.items);
+  const offices = cfg.offices.map(readOffice_);
   items.forEach(it => {
-    if (!String(it.item || '').trim()) throw new Error('Missing item');
-    findOffice_(it.office);
+    const office = offices.find(o => o.name === it.office);
+    const found = office && office.items.find(x => x.name === it.item);
+    if (!found) throw new Error(`${it.item} isn't listed in ${it.office} anymore. Reload and try again.`);
+    const left = stockNumber_(found.qty);
+    if (left !== null && it.qty > left) throw new Error(`Only ${left} ${it.item} left in ${it.office}.`);
   });
-  const now = new Date();
-  const rows = items.map(it => [
-    Utilities.getUuid().slice(0, 8), now, it.office, it.item, it.box || '', Number(it.qty) || 1,
-    b.name.trim(), b.netid.trim().toLowerCase(), (b.event || '').trim(), 'OUT', '',
-  ]);
-  const sh = logSheet_();
-  sh.getRange(sh.getLastRow() + 1, 1, rows.length, LOG_HEADERS.length).setValues(rows);
-  return { ids: rows.map(r => r[0]) };
+  writeForm_(TAKE_OUT, `${name}, ${netid}`, String(b.team || '').trim(), String(b.event || '').trim(), items, offices);
 }
 
-// Takes `ids` (several) or `id` (one).
+// b: {who, items: [{office, item, qty}]}; who is the "Name, Net ID" the items were taken out under.
 function checkin_(b) {
-  const log = logRows_();
-  const entries = (b.ids || [b.id]).map(id => {
-    const entry = log.find(l => l.id === String(id));
-    if (!entry) throw new Error('Checkout not found');
-    return entry;
-  }).filter(e => e.status === 'OUT');
-  if (!entries.length) throw new Error('Already checked in');
-  const sh = logSheet_();
-  const now = new Date();
-  entries.forEach(e => sh.getRange(e.row, 10, 1, 2).setValues([['IN', now]]));
-  return { ids: entries.map(e => e.id) };
-}
-
-function updateLog_(p) {
-  const entry = findLog_(p.id);
-  const status = p.status === 'IN' ? 'IN' : 'OUT';
-  const checkedIn = status === 'OUT' ? '' : (entry.in ? new Date(entry.in) : new Date());
-  logSheet_().getRange(entry.row, 3, 1, 9).setValues([[
-    p.office, p.item, p.box, Number(p.qty) || 1, p.name,
-    String(p.netid || '').trim().toLowerCase(), p.event, status, checkedIn,
-  ]]);
+  const who = String(b.who || '').trim();
+  if (!who) throw new Error('Missing person');
+  const items = mergeItems_(b.items);
+  const { offices, out } = snapshot_();
+  const key = personKey_(who);
+  items.forEach(it => {
+    const o = out.find(x => x.key === key && x.office === it.office && x.item === it.item);
+    if (!o) throw new Error(`${who} doesn't have ${it.item} checked out.`);
+    if (it.qty > o.qty) throw new Error(`${who} only has ${o.qty} ${it.item} checked out.`);
+  });
+  writeForm_(CHECK_IN, who, '', '', items, offices);
 }
 
 // ---------- Admin portal ----------
@@ -341,25 +461,38 @@ function removeAdmin_(p, me) {
   return { admins: cfg.admins };
 }
 
+// Deletes one form row, after checking it is still the row the portal showed.
+function deleteLog_(p) {
+  const sh = formSheet_();
+  const [ts, who] = sh.getRange(p.row, 1, 1, 2).getValues()[0];
+  const iso = ts instanceof Date ? ts.toISOString() : String(ts);
+  if (p.row < 2 || iso !== p.ts || String(who).trim() !== p.who) {
+    throw new Error('That row changed in the sheet since you loaded it. Reload and try again.');
+  }
+  sh.deleteRow(p.row);
+}
+
 // Single entry point for Admin.html (google.script.run).
 function adminApi(action, p) {
   const email = requireAdmin_();
+  if (action === 'init') {
+    const ss = ss_();
+    return {
+      email,
+      config: getConfig_(),
+      sheets: ss.getSheets().map(s => s.getName()).filter(n => n !== FORM_SHEET),
+      sheetUrl: ss.getUrl(),
+    };
+  }
+  if (action === 'log') {
+    const { log, out } = snapshot_();
+    return { log: log.reverse(), out };
+  }
+  if (action === 'rows') return readRows_(findOffice_(p.office));
   return withLock_(() => {
     switch (action) {
-      case 'init': {
-        const ss = ss_();
-        return {
-          email,
-          config: getConfig_(),
-          sheets: ss.getSheets().map(s => s.getName()).filter(n => n !== LOG_SHEET),
-          sheetUrl: ss.getUrl(),
-        };
-      }
-      case 'log': return logRows_().reverse();
-      case 'updateLog': return updateLog_(p);
       case 'checkin': return checkin_(p);
-      case 'deleteLog': logSheet_().deleteRow(findLog_(p.id).row); return null;
-      case 'rows': return readRows_(findOffice_(p.office));
+      case 'deleteLog': return deleteLog_(p);
       case 'saveRow': return saveRow_(p);
       case 'addRow': return addRow_(p);
       case 'deleteRow': return deleteRow_(p);
