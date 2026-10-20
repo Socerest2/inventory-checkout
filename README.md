@@ -1,28 +1,27 @@
 # Inventory Check Out
 
-A check-out/check-in page for the **26-27 Warehouse Inventory** Google Sheet. It's hosted on GitHub Pages and has a Google Apps Script backend.
+A check-out/check-in page for the **26-27 Warehouse Inventory** Google Sheet. The page is hosted on GitHub Pages, and a Google Apps Script handles the sheet.
 
-- Every check-out adds a row to a **Checkout Log** tab in the sheet. The tab is created automatically.
-- A check-in marks that row `IN` and records the time.
-- Items are read live from the `OFSA Basement Inventory` and `DM Office` tabs.
+- Every check-out adds a row to a **Checkout Log** tab in the sheet. A check-in marks that row `IN`.
+- Items are read live from each office's sheet tab (columns A–C).
 
-## One-time setup (about 2 minutes)
+## Admin portal
 
-1. Go to <https://script.google.com>, click **New project**, and replace `Code.gs` with [`apps-script/Code.gs`](apps-script/Code.gs).
-2. Click **Deploy → New deployment → Web app**, and set:
-   - **Execute as:** Me
-   - **Who has access:** Anyone
-3. Click **Deploy**, authorize with your Google account, and copy the **Web app URL**. It ends in `/exec`.
-4. Paste that URL into [`config.js`](config.js) as `window.API_URL = '...'`, then commit.
+The **Admin** link at the bottom of the site opens the admin portal. You can change everything there without editing any code:
 
-If you edit `Code.gs` later, go to **Deploy → Manage deployments → Edit → New version** so the URL stays the same.
+- **Checkouts:** search the full log, check items in, and edit or delete entries.
+- **Inventory:** edit, add or delete item rows in each office's sheet tab.
+- **Settings:** set the site title, choose whether an event is required, and manage offices (add, rename, reorder, or point them at a different sheet tab and starting row).
 
-## Autofill
+Admins are the people who have **edit access to the inventory sheet**. You add or remove them with the sheet's **Share** button.
 
-- Typing in **Filter items** narrows the item dropdown. When only one item matches, it's selected automatically. Clicking an item in the list selects it.
-- The Name, NetID and Event fields remember what you entered last.
-- Typing a NetID that has been used before fills in the matching name. Earlier events are offered as suggestions.
+## Apps Script setup
 
-## Adding an office tab
+The Apps Script project has two files, [`apps-script/Code.gs`](apps-script/Code.gs) and [`apps-script/Admin.html`](apps-script/Admin.html). It is deployed twice:
 
-Add an entry to `OFFICES` in `Code.gs` and to `OFFICES` in `index.html`.
+| Deployment | Execute as | Who has access | Used by |
+|---|---|---|---|
+| Public API | Me | Anyone | `API_URL` in `config.js` |
+| Admin portal | User accessing the web app | Anyone with Google account | `ADMIN_URL` in `config.js` (with `?page=admin`) |
+
+After you change the script, update **both** deployments with **Deploy → Manage deployments → Edit → Version: New version**. Their URLs stay the same.
