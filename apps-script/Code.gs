@@ -270,9 +270,10 @@ const personKey_ = who => person_(who).netid || who.toLowerCase();
 
 // ---------- Names ----------
 
-// Display names admins set per NetID: {netid: {name, source: 'admin'}}.
-// (The Google directory isn't available to this script at Rutgers.)
+// Saved display names per NetID: {netid: {name, source: 'admin'|'directory', checked}}.
 const NAMES_KEY = 'names:' + SPREADSHEET_ID;
+const LOOKUPS_PER_LOAD = 5;
+const RETRY_MS = 7 * 24 * 3600 * 1000;
 
 function names_() {
   return JSON.parse(PropertiesService.getScriptProperties().getProperty(NAMES_KEY) || '{}');
@@ -282,15 +283,61 @@ function saveNames_(names) {
   PropertiesService.getScriptProperties().setProperty(NAMES_KEY, JSON.stringify(names));
 }
 
-// NetID -> display name: an admin's entry wins, then the name typed on the check-out site.
+// Name from the Google Workspace directory (People API advanced service):
+// '' if not listed, null if the lookup itself failed (e.g. permission missing).
+function directoryName_(netid) {
+  if (typeof People === 'undefined') return null;
+  try {
+    const res = People.People.searchDirectoryPeople({
+      query: netid,
+      readMask: 'names,emailAddresses',
+      sources: ['DIRECTORY_SOURCE_TYPE_DOMAIN_PROFILE', 'DIRECTORY_SOURCE_TYPE_DOMAIN_CONTACT'],
+    });
+    const match = (res.people || []).find(p => (p.emailAddresses || []).some(e => e.value.toLowerCase().startsWith(netid + '@')));
+    return (match && match.names && match.names[0] && match.names[0].displayName) || '';
+  } catch (err) {
+    console.warn('Directory lookup failed: ' + err);
+    return null;
+  }
+}
+
+// Run from the editor to (re)approve the directory permission and see a sample.
+function testDirectoryLookup() {
+  ScriptApp.requireScopes(ScriptApp.AuthMode.FULL, ['https://www.googleapis.com/auth/directory.readonly']);
+  ['egf48', 'jsh253', 'vjp91'].forEach(id => {
+    const name = directoryName_(id);
+    Logger.log(id + ' -> ' + (name === null ? '(lookup failed, see warning above)' : name || '(not in directory)'));
+  });
+}
+
+// NetID -> display name. An admin's entry wins, then the Google directory,
+// then the name typed on the check-out site. Looks up a few new NetIDs per load.
 function resolveNames_(log) {
   const saved = names_();
-  const out = {};
+  const typed = {};
+  const netids = new Set(Object.keys(saved));
   log.forEach(e => {
     const p = person_(e.who);
-    if (p.netid && p.name !== p.netid) out[p.netid] = p.name;
+    if (!p.netid) return;
+    netids.add(p.netid);
+    if (p.name !== p.netid) typed[p.netid] = p.name;
   });
-  Object.keys(saved).forEach(id => { if (saved[id].name) out[id] = saved[id].name; });
+  let lookups = 0;
+  netids.forEach(id => {
+    const s = saved[id];
+    if ((s && (s.name || Date.now() - s.checked < RETRY_MS)) || lookups >= LOOKUPS_PER_LOAD) return;
+    lookups++;
+    const name = directoryName_(id);
+    // A failed lookup is retried in an hour; "not listed" in a week.
+    const checked = name === null ? Date.now() - RETRY_MS + 3600 * 1000 : Date.now();
+    saved[id] = { name: name || '', source: 'directory', checked };
+  });
+  if (lookups) saveNames_(saved);
+  const out = {};
+  netids.forEach(id => {
+    const name = (saved[id] && saved[id].name) || typed[id];
+    if (name) out[id] = name;
+  });
   return out;
 }
 
@@ -308,8 +355,8 @@ function setName_(p) {
   if (!/^[a-z0-9._-]+$/.test(netid)) throw new Error('Enter a NetID like egf48.');
   const saved = names_();
   const name = String(p.name || '').trim();
-  // Clearing a name goes back to the one typed on the site, if any.
-  if (name) saved[netid] = { name, source: 'admin' }; else delete saved[netid];
+  // Clearing a name goes back to the directory / typed name.
+  if (name) saved[netid] = { name, source: 'admin', checked: Date.now() }; else delete saved[netid];
   saveNames_(saved);
 }
 
@@ -317,10 +364,8 @@ function listNames_() {
   const { log } = snapshot_();
   const names = resolveNames_(log);
   const saved = names_();
-  // Every NetID seen in the log, named or not, so admins can fill in the blanks.
-  log.forEach(e => { const id = person_(e.who).netid; if (id && !(id in names)) names[id] = ''; });
   return Object.keys(names).sort().map(id => ({
-    netid: id, name: names[id], source: saved[id] && saved[id].name ? 'admin' : names[id] ? 'typed on site' : 'no name yet',
+    netid: id, name: names[id], source: saved[id] && saved[id].name ? saved[id].source : 'typed on site',
   }));
 }
 
