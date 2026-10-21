@@ -283,9 +283,10 @@ function saveNames_(names) {
   PropertiesService.getScriptProperties().setProperty(NAMES_KEY, JSON.stringify(names));
 }
 
-// Name from the Google Workspace directory (People API advanced service), or ''.
+// Name from the Google Workspace directory (People API advanced service):
+// '' if not listed, null if the lookup itself failed (e.g. permission missing).
 function directoryName_(netid) {
-  if (typeof People === 'undefined') return '';
+  if (typeof People === 'undefined') return null;
   try {
     const res = People.People.searchDirectoryPeople({
       query: netid,
@@ -295,13 +296,18 @@ function directoryName_(netid) {
     const match = (res.people || []).find(p => (p.emailAddresses || []).some(e => e.value.toLowerCase().startsWith(netid + '@')));
     return (match && match.names && match.names[0] && match.names[0].displayName) || '';
   } catch (err) {
-    return '';
+    console.warn('Directory lookup failed: ' + err);
+    return null;
   }
 }
 
-// Run once from the editor to approve the directory permission and see a sample.
+// Run from the editor to (re)approve the directory permission and see a sample.
 function testDirectoryLookup() {
-  ['egf48', 'jsh253', 'vjp91'].forEach(id => Logger.log(id + ' -> ' + (directoryName_(id) || '(not found)')));
+  ScriptApp.requireScopes(ScriptApp.AuthMode.FULL, ['https://www.googleapis.com/auth/directory.readonly']);
+  ['egf48', 'jsh253', 'vjp91'].forEach(id => {
+    const name = directoryName_(id);
+    Logger.log(id + ' -> ' + (name === null ? '(lookup failed, see warning above)' : name || '(not in directory)'));
+  });
 }
 
 // NetID -> display name. An admin's entry wins, then the Google directory,
@@ -321,7 +327,10 @@ function resolveNames_(log) {
     const s = saved[id];
     if ((s && (s.name || Date.now() - s.checked < RETRY_MS)) || lookups >= LOOKUPS_PER_LOAD) return;
     lookups++;
-    saved[id] = { name: directoryName_(id), source: 'directory', checked: Date.now() };
+    const name = directoryName_(id);
+    // A failed lookup is retried in an hour; "not listed" in a week.
+    const checked = name === null ? Date.now() - RETRY_MS + 3600 * 1000 : Date.now();
+    saved[id] = { name: name || '', source: 'directory', checked };
   });
   if (lookups) saveNames_(saved);
   const out = {};
