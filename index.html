@@ -142,6 +142,8 @@ const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '
 const when = iso => { const d = new Date(iso); return isNaN(d) ? '' : d.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }); };
 const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
 const isConsumable = it => /consum/i.test(it.type || '');
+// "Emma F (egf48)" when the backend found a name, else what was entered.
+const personLabel = p => (p.name && p.netid && p.name !== p.netid ? `${p.name} (${p.netid})` : p.name || p.who);
 // Current Qty as a number, or null when the sheet has something like "?".
 const left = it => { const s = String(it?.qty ?? '').replace(/,/g, '').trim(); const n = Number(s); return s && isFinite(n) ? n : null; };
 
@@ -305,7 +307,7 @@ function renderRecent() {
     const isIn = /check in/i.test(e.action);
     const items = e.items.map(it => `${it.item} ×${it.qty}`).join(', ');
     return `<div class="row"><span class="tag ${isIn ? 'IN' : 'OUT'}">${isIn ? 'IN' : 'OUT'}</span><div class="grow"><span class="name">${esc(items || '(no items)')}</span>` +
-      `<div class="meta">${esc([e.who, e.event, when(e.ts)].filter(Boolean).join(' · '))}</div></div></div>`;
+      `<div class="meta">${esc([personLabel(e), e.event, when(e.ts)].filter(Boolean).join(' · '))}</div></div></div>`;
   }).join('');
 }
 

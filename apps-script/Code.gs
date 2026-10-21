@@ -268,6 +268,98 @@ function person_(who) {
 
 const personKey_ = who => person_(who).netid || who.toLowerCase();
 
+// ---------- Names ----------
+
+// Saved display names per NetID: {netid: {name, source: 'admin'|'directory', checked}}.
+const NAMES_KEY = 'names:' + SPREADSHEET_ID;
+const LOOKUPS_PER_LOAD = 5;
+const RETRY_MS = 7 * 24 * 3600 * 1000;
+
+function names_() {
+  return JSON.parse(PropertiesService.getScriptProperties().getProperty(NAMES_KEY) || '{}');
+}
+
+function saveNames_(names) {
+  PropertiesService.getScriptProperties().setProperty(NAMES_KEY, JSON.stringify(names));
+}
+
+// Name from the Google Workspace directory (People API advanced service), or ''.
+function directoryName_(netid) {
+  if (typeof People === 'undefined') return '';
+  try {
+    const res = People.People.searchDirectoryPeople({
+      query: netid,
+      readMask: 'names,emailAddresses',
+      sources: ['DIRECTORY_SOURCE_TYPE_DOMAIN_PROFILE', 'DIRECTORY_SOURCE_TYPE_DOMAIN_CONTACT'],
+    });
+    const match = (res.people || []).find(p => (p.emailAddresses || []).some(e => e.value.toLowerCase().startsWith(netid + '@')));
+    return (match && match.names && match.names[0] && match.names[0].displayName) || '';
+  } catch (err) {
+    return '';
+  }
+}
+
+// Run once from the editor to approve the directory permission and see a sample.
+function testDirectoryLookup() {
+  ['egf48', 'jsh253', 'vjp91'].forEach(id => Logger.log(id + ' -> ' + (directoryName_(id) || '(not found)')));
+}
+
+// NetID -> display name. An admin's entry wins, then the Google directory,
+// then the name typed on the check-out site. Looks up a few new NetIDs per load.
+function resolveNames_(log) {
+  const saved = names_();
+  const typed = {};
+  const netids = new Set(Object.keys(saved));
+  log.forEach(e => {
+    const p = person_(e.who);
+    if (!p.netid) return;
+    netids.add(p.netid);
+    if (p.name !== p.netid) typed[p.netid] = p.name;
+  });
+  let lookups = 0;
+  netids.forEach(id => {
+    const s = saved[id];
+    if ((s && (s.name || Date.now() - s.checked < RETRY_MS)) || lookups >= LOOKUPS_PER_LOAD) return;
+    lookups++;
+    saved[id] = { name: directoryName_(id), source: 'directory', checked: Date.now() };
+  });
+  if (lookups) saveNames_(saved);
+  const out = {};
+  netids.forEach(id => {
+    const name = (saved[id] && saved[id].name) || typed[id];
+    if (name) out[id] = name;
+  });
+  return out;
+}
+
+// Adds `name` (resolved) and `netid` to log entries and checked-out lines.
+function withNames_(log, out) {
+  const names = resolveNames_(log);
+  const label = who => { const p = person_(who); return { name: names[p.netid] || p.name, netid: p.netid }; };
+  log.forEach(e => Object.assign(e, label(e.who)));
+  out.forEach(o => Object.assign(o, label(o.who)));
+  return names;
+}
+
+function setName_(p) {
+  const netid = String(p.netid || '').trim().toLowerCase();
+  if (!/^[a-z0-9._-]+$/.test(netid)) throw new Error('Enter a NetID like egf48.');
+  const saved = names_();
+  const name = String(p.name || '').trim();
+  // Clearing a name goes back to the directory / typed name.
+  if (name) saved[netid] = { name, source: 'admin', checked: Date.now() }; else delete saved[netid];
+  saveNames_(saved);
+}
+
+function listNames_() {
+  const { log } = snapshot_();
+  const names = resolveNames_(log);
+  const saved = names_();
+  return Object.keys(names).sort().map(id => ({
+    netid: id, name: names[id], source: saved[id] && saved[id].name ? saved[id].source : 'typed on site',
+  }));
+}
+
 // Reusable items each person still has: take-outs minus check-ins.
 function outstanding_(log, typeOf) {
   const map = new Map();
@@ -307,12 +399,10 @@ function getData_(fresh) {
     if (hit) return JSON.parse(hit);
   }
   const { cfg, offices, log, out } = snapshot_();
-  const people = {};
+  const people = withNames_(log, out);
   const events = new Set();
   const teams = new Set();
   log.forEach(e => {
-    const p = person_(e.who);
-    if (p.netid && p.name !== p.netid) people[p.netid] = p.name;
     if (e.event) events.add(e.event);
     if (e.team) teams.add(e.team);
   });
@@ -320,7 +410,7 @@ function getData_(fresh) {
     config: { title: cfg.title, requireEvent: !!cfg.requireEvent, offices: offices.map(o => o.name) },
     items: Object.fromEntries(offices.map(o => [o.name, o.items])),
     out: out.sort((a, b) => (a.since < b.since ? 1 : -1)),
-    recent: log.slice(-30).reverse().map(e => ({ ts: e.ts, who: e.who, action: e.action, event: e.event, items: e.items })),
+    recent: log.slice(-30).reverse().map(e => ({ ts: e.ts, who: e.who, name: e.name, netid: e.netid, action: e.action, event: e.event, items: e.items })),
     people,
     events: [...events],
     teams: [...teams],
@@ -486,7 +576,14 @@ function adminApi(action, p) {
   }
   if (action === 'log') {
     const { log, out } = snapshot_();
+    withNames_(log, out);
     return { log: log.reverse(), out };
+  }
+  if (action === 'names') return listNames_();
+  if (action === 'setName') {
+    setName_(p);
+    CacheService.getScriptCache().remove(CACHE_KEY);
+    return listNames_();
   }
   if (action === 'rows') return readRows_(findOffice_(p.office));
   return withLock_(() => {

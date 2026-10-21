@@ -123,6 +123,15 @@
         <button class="primary" id="save-settings">Save settings</button>
       </div>
 
+      <h2>People</h2>
+      <p class="muted">Names shown for NetIDs. They come from the Google directory or what people typed on the site; set one here to override it, or clear it to go back.</p>
+      <div class="wrap"><table><thead><tr><th>NetID</th><th>Name</th><th>From</th><th></th></tr></thead><tbody id="people"></tbody></table></div>
+      <form id="add-person" class="bar" style="margin-top:10px">
+        <input id="person-netid" placeholder="NetID" autocapitalize="none" autocomplete="off">
+        <input id="person-name" placeholder="Name" autocomplete="off">
+        <button class="primary" type="submit">Set name</button>
+      </form>
+
       <h2>Admins</h2>
       <p class="muted" id="admins-note"></p>
       <div class="wrap"><table><tbody id="admins"></tbody></table></div>
@@ -199,27 +208,31 @@ async function loadLog() {
 }
 
 const matches = (q, ...parts) => !q || parts.join(' ').toLowerCase().includes(q);
+// Name on top, NetID (or the raw "Name, Net ID" entry) underneath.
+const personCell = p => p.name && p.name !== p.netid
+  ? `${esc(p.name)}<br><span class="muted">${esc(p.netid || p.who)}</span>`
+  : esc(p.who);
 
 function renderLog() {
   const q = $('log-q').value.trim().toLowerCase();
   const off = $('log-office').value;
   const act_ = $('log-action').value;
 
-  const out = state.out.filter(o => (!off || o.office === off) && matches(q, o.who, o.item, o.event, o.team));
+  const out = state.out.filter(o => (!off || o.office === off) && matches(q, o.who, o.name, o.item, o.event, o.team));
   $('out').innerHTML = out.length
     ? `<table><thead><tr><th>Person</th><th>Item</th><th>Qty</th><th>Office</th><th>Team / event</th><th>Out since</th><th></th></tr></thead><tbody>` +
-      out.map(o => `<tr data-key="${esc(o.key)}" data-office="${esc(o.office)}" data-item="${esc(o.item)}"><td>${esc(o.who)}</td><td>${esc(o.item)}</td><td>${esc(o.qty)}</td>` +
+      out.map(o => `<tr data-key="${esc(o.key)}" data-office="${esc(o.office)}" data-item="${esc(o.item)}"><td>${personCell(o)}</td><td>${esc(o.item)}</td><td>${esc(o.qty)}</td>` +
         `<td>${esc(o.office)}</td><td>${esc([o.team, o.event].filter(Boolean).join(' · '))}</td><td>${when(o.since)}</td>` +
         `<td class="actions"><button class="small" data-act="checkin">Check in</button></td></tr>`).join('') + '</tbody></table>'
     : '<p class="muted">Nothing checked out.</p>';
 
   const log = state.log.filter(e => (!act_ || e.action === act_) &&
     (!off || e.items.some(it => it.office === off)) &&
-    matches(q, e.who, e.team, e.event, e.items.map(it => it.item).join(' ')));
+    matches(q, e.who, e.name, e.team, e.event, e.items.map(it => it.item).join(' ')));
   $('log-count').textContent = `${log.length} of ${state.log.length} rows`;
   $('log').innerHTML = log.length
     ? `<table><thead><tr><th>When</th><th>Person</th><th>Action</th><th>Items</th><th>Team / event</th><th>Row</th><th></th></tr></thead><tbody>` +
-      log.map(e => `<tr data-row="${e.row}"><td>${when(e.ts)}</td><td>${esc(e.who)}</td>` +
+      log.map(e => `<tr data-row="${e.row}"><td>${when(e.ts)}</td><td>${personCell(e)}</td>` +
         `<td><span class="tag ${/check in/i.test(e.action) ? 'IN' : 'OUT'}">${esc(e.action || '—')}</span></td>` +
         `<td>${e.items.map(it => `${esc(it.item)} ×${esc(it.qty)} <span class="muted">${esc(it.office)}</span>`).join('<br>')}</td>` +
         `<td>${esc([e.team, e.event].filter(Boolean).join(' · '))}${e.notes ? `<br><span class="muted">${esc(e.notes)}</span>` : ''}</td>` +
@@ -350,6 +363,40 @@ $('save-settings').onclick = async () => {
   applyConfig(saved);
 };
 
+// ---------- People ----------
+
+async function loadPeople() {
+  try { renderPeople(await run('names')); } catch (err) { $('people').innerHTML = `<tr><td class="muted">${esc(err.message || err)}</td></tr>`; }
+}
+
+function renderPeople(list) {
+  $('people').innerHTML = list.length ? list.map(p => `<tr data-netid="${esc(p.netid)}"><td>${esc(p.netid)}</td>` +
+    `<td><input value="${esc(p.name)}"></td><td class="muted">${esc(p.source)}</td>` +
+    `<td class="actions"><button class="small" data-act="save">Save</button>${p.source === 'admin' ? '<button class="small danger" data-act="clear">Clear</button>' : ''}</td></tr>`).join('')
+    : '<tr><td class="muted">No names yet.</td></tr>';
+}
+
+async function setName(netid, name) {
+  let list;
+  const ok = await act(name ? `Saving name for ${netid}` : `Clearing name for ${netid}`, async () => { list = await run('setName', { netid, name }); });
+  if (ok) renderPeople(list);
+  return ok;
+}
+
+$('people').onclick = e => {
+  const btn = e.target.closest('button[data-act]');
+  if (!btn) return;
+  const tr = btn.closest('tr');
+  setName(tr.dataset.netid, btn.dataset.act === 'clear' ? '' : tr.querySelector('input').value.trim());
+};
+$('add-person').onsubmit = async e => {
+  e.preventDefault();
+  if (await setName($('person-netid').value.trim(), $('person-name').value.trim())) {
+    $('person-netid').value = '';
+    $('person-name').value = '';
+  }
+};
+
 // ---------- Admins ----------
 
 function renderAdmins() {
@@ -406,6 +453,7 @@ function applyConfig(cfg) {
     $('who').innerHTML = `Signed in as ${esc(d.email)} · <a href="${esc(d.sheetUrl)}" target="_blank">Open sheet</a>`;
     $('sheet-link').href = d.sheetUrl;
     applyConfig(d.config);
+    loadPeople();
     $('app').hidden = false;
     await loadLog();
   } catch (err) {
